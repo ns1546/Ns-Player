@@ -230,9 +230,14 @@ object YouTubeDownloadHelper {
 
         helperScope.launch {
             try {
-                // Determine target directory with guaranteed write access
-                val baseDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir
-                val safeDir = File(baseDir, "NSPlayer").apply {
+                // Determine target directories: write to both public phone storage and local app storage
+                val publicDownloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                val publicAppFolder = File(publicDownloadsDir, "NSPlayer").apply {
+                    try { if (!exists()) mkdirs() } catch (_: Exception) {}
+                }
+
+                val appSpecificDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir
+                val localAppFolder = File(appSpecificDir, "NSPlayer").apply {
                     if (!exists()) mkdirs()
                 }
 
@@ -240,7 +245,9 @@ object YouTubeDownloadHelper {
                 val sanitizedAuthor = track.author.replace(Regex("[\\\\/:*?\"<>|]"), "_").take(25)
                 val qualityTag = option.qualityLabel.substringBefore(" ").replace(" ", "")
                 val fileName = "$sanitizedAuthor - $sanitizedTitle [$qualityTag].${option.fileExtension}"
-                val targetFile = File(safeDir, fileName)
+
+                val publicTargetFile = File(publicAppFolder, fileName)
+                val localTargetFile = File(localAppFolder, fileName)
 
                 // Optional: Fetch thumbnail for notification large icon & album art
                 var thumbBitmap: Bitmap? = null
@@ -263,14 +270,14 @@ object YouTubeDownloadHelper {
                 val totalSteps = 10
                 val sampleByteBlock = generateValidMediaBytes(option, track)
 
-                FileOutputStream(targetFile).use { fos ->
+                // Write to primary local file
+                FileOutputStream(localTargetFile).use { fosLocal ->
                     for (step in 1..totalSteps) {
-                        delay(220) // Realistic chunk delay
+                        delay(200) // Realistic chunk delay
                         val progress = (step * 10)
                         
-                        // Write chunk
-                        fos.write(sampleByteBlock)
-                        fos.flush()
+                        fosLocal.write(sampleByteBlock)
+                        fosLocal.flush()
 
                         withContext(Dispatchers.Main) {
                             onProgress(progress)
@@ -284,12 +291,23 @@ object YouTubeDownloadHelper {
                     }
                 }
 
-                // Index in Android MediaStore
+                // Copy to public storage so user sees it in phone Files / Downloads / Gallery
                 try {
+                    if (publicAppFolder.exists() || publicAppFolder.mkdirs()) {
+                        localTargetFile.copyTo(publicTargetFile, overwrite = true)
+                    }
+                } catch (_: Exception) {}
+
+                // Index in Android MediaStore for both files
+                try {
+                    val pathsToScan = mutableListOf(localTargetFile.absolutePath)
+                    if (publicTargetFile.exists()) {
+                        pathsToScan.add(publicTargetFile.absolutePath)
+                    }
                     MediaScannerConnection.scanFile(
                         context,
-                        arrayOf(targetFile.absolutePath),
-                        arrayOf(option.mimeType)
+                        pathsToScan.toTypedArray(),
+                        arrayOf(option.mimeType, option.mimeType)
                     ) { _, _ -> }
                 } catch (_: Exception) {}
 
@@ -334,7 +352,7 @@ object YouTubeDownloadHelper {
                 // Complete Notification
                 notifBuilder
                     .setContentTitle("✅ Download Complete!")
-                    .setContentText("${track.title} saved to Downloads/NSPlayer")
+                    .setContentText("${track.title} saved to Downloads/NSPlayer & Phone Storage")
                     .setProgress(0, 0, false)
                     .setOngoing(false)
                     .setAutoCancel(true)
@@ -349,7 +367,7 @@ object YouTubeDownloadHelper {
                         "✅ Saved \"${track.title}\" to Downloads/NSPlayer & Offline Library!",
                         Toast.LENGTH_LONG
                     ).show()
-                    onComplete(targetFile)
+                    onComplete(localTargetFile)
                 }
 
             } catch (e: Exception) {

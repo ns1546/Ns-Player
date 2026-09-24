@@ -86,6 +86,7 @@ class MainViewModel(
     val ambientEngine = AmbientSoundscapeEngine.getInstance()
     val gestureManager = MotionGestureManager(context)
     val youTubePlayerController = com.example.domain.YouTubePlayerController.getInstance(context)
+    val youTubeExoPlayerManager = com.example.domain.YouTubeExoPlayerManager.getInstance(context)
     val lyricsManager = com.example.domain.LyricsManager(context, playlistDao)
 
     private val _isDriveMode = MutableStateFlow(false)
@@ -159,6 +160,10 @@ class MainViewModel(
             onYouTubePlayerError(errorCode)
         }
 
+        youTubeExoPlayerManager.onTrackEnded = {
+            playNextYouTubeTrack()
+        }
+
         // Automatic periodic database maintenance on startup
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             try {
@@ -183,6 +188,7 @@ class MainViewModel(
         } catch (_: Exception) {}
         gestureManager.stopListening()
         playerManager.release()
+        youTubeExoPlayerManager.release()
         youTubePlayerController.release()
     }
 
@@ -488,6 +494,7 @@ class MainViewModel(
     fun setYouTubePlaybackSpeed(speed: Float) {
         _youTubePlaybackSpeed.value = speed
         _youTubeCommand.value = "speed:$speed"
+        youTubeExoPlayerManager.setSpeed(speed)
         youTubePlayerController.setSpeed(speed)
     }
 
@@ -507,6 +514,7 @@ class MainViewModel(
         val safeVol = volume.coerceIn(0, 100)
         _youTubeVolume.value = safeVol
         _youTubeCommand.value = "volume:$safeVol"
+        youTubeExoPlayerManager.setVolume(safeVol)
         youTubePlayerController.setVolume(safeVol)
     }
 
@@ -737,6 +745,8 @@ class MainViewModel(
 
         // 3. SMART RESUME: Resume from where the user left off if interrupted or crossed
         val targetPos = forceStartFromPosition ?: _youTubePlaybackPositions[track.videoId] ?: 0f
+        youTubeExoPlayerManager.playTrack(track, targetPos)
+
         if (targetPos > 5f && (track.durationSeconds <= 0 || targetPos < track.durationSeconds - 5)) {
             _youTubeCurrentTime.value = targetPos
             _youTubeCommand.value = "load:${track.videoId}:${targetPos.toInt()}"
@@ -759,6 +769,7 @@ class MainViewModel(
         _youTubePlaybackPositions[cur.videoId] = 0f
         _youTubeCurrentTime.value = 0f
         _youTubeCommand.value = "seek:0"
+        youTubeExoPlayerManager.seekTo(0f)
         youTubePlayerController.seekTo(0f)
         resumeYouTube()
         _resumeNotice.value = null
@@ -779,6 +790,7 @@ class MainViewModel(
     fun pauseYouTube() {
         _isYouTubePlaying.value = false
         _youTubeCommand.value = "pause"
+        youTubeExoPlayerManager.pause()
         youTubePlayerController.pause()
     }
 
@@ -786,12 +798,14 @@ class MainViewModel(
         playerManager.pause()
         _isYouTubePlaying.value = true
         _youTubeCommand.value = "play"
+        youTubeExoPlayerManager.play()
         youTubePlayerController.play()
     }
 
     fun seekYouTube(seconds: Float) {
         _youTubeCurrentTime.value = seconds
         _youTubeCommand.value = "seek:${seconds.toInt()}"
+        youTubeExoPlayerManager.seekTo(seconds)
         youTubePlayerController.seekTo(seconds)
     }
 
@@ -838,6 +852,7 @@ class MainViewModel(
         _isYouTubePlayerVisible.value = false
         _isFullScreenVideo.value = false
         _youTubeCommand.value = "pause"
+        youTubeExoPlayerManager.pause()
         youTubePlayerController.pause()
     }
 

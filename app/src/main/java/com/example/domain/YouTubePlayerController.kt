@@ -38,6 +38,7 @@ class YouTubePlayerController private constructor(private val appContext: Contex
     private var webView: WebView? = null
     private var isPlayerReady = false
     private var currentVideoId: String = ""
+    private var isIntentionalPause = false
 
     private var currentTitle: String = "YouTube Video"
     private var currentArtist: String = "YouTube"
@@ -62,12 +63,28 @@ class YouTubePlayerController private constructor(private val appContext: Contex
     private val _isPlaying = MutableStateFlow(false)
     val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
 
-    // KeepAlive runnable
+    // Persistent KeepAlive runnable to prevent OS from suspending background streaming
     private val keepAliveRunnable = object : Runnable {
         override fun run() {
-            if (_isBackgroundPlaybackActive.value) {
-                evaluate("if (window.player && window.player.getPlayerState && window.player.getPlayerState() === 1) { /* keepalive ok */ }")
-                mainHandler.postDelayed(this, 2000)
+            if (_isPlaying.value && !isIntentionalPause) {
+                evaluate("""
+                    try {
+                        if (window.isUserPlaying) {
+                            if (window.player && window.player.getPlayerState) {
+                                var st = window.player.getPlayerState();
+                                if (st === 2 || st === 3) {
+                                    window.player.playVideo();
+                                }
+                            } else {
+                                var ifr = document.getElementById('player');
+                                if (ifr && ifr.contentWindow) {
+                                    ifr.contentWindow.postMessage('{"event":"command","func":"playVideo","args":""}', '*');
+                                }
+                            }
+                        }
+                    } catch(e) {}
+                """.trimIndent())
+                mainHandler.postDelayed(this, 1500)
             }
         }
     }
@@ -218,10 +235,15 @@ class YouTubePlayerController private constructor(private val appContext: Contex
                     javaScriptCanOpenWindowsAutomatically = true
                     mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     cacheMode = WebSettings.LOAD_DEFAULT
-                    // Modern Android Chrome User-Agent
                     userAgentString = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
                 }
-                webChromeClient = WebChromeClient()
+                webChromeClient = object : WebChromeClient() {
+                    override fun onPermissionRequest(request: android.webkit.PermissionRequest?) {
+                        try {
+                            request?.grant(request.resources)
+                        } catch (_: Exception) {}
+                    }
+                }
                 webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean = false
                 }
@@ -241,9 +263,19 @@ class YouTubePlayerController private constructor(private val appContext: Contex
                                 if (state == 1) { // Playing
                                     isPlayerReady = true
                                     _isPlaying.value = true
+                                    isIntentionalPause = false
                                     _lastErrorCode.value = null
                                     acquireLocks()
-                                } else if (state == 2 || state == 0) { // Paused or Ended
+                                } else if (state == 2) { // Paused
+                                    if (isIntentionalPause) {
+                                        _isPlaying.value = false
+                                        releaseLocks()
+                                    } else {
+                                        // Unintentional background pause: keep locks and auto-resume
+                                        acquireLocks()
+                                        evaluate("if (window.isUserPlaying) { playVideo(); }")
+                                    }
+                                } else if (state == 0) { // Ended
                                     _isPlaying.value = false
                                     releaseLocks()
                                 }
@@ -292,6 +324,7 @@ class YouTubePlayerController private constructor(private val appContext: Contex
     fun loadTrack(videoId: String, startSeconds: Int = 0) {
         val wv = webView ?: return
         _lastErrorCode.value = null
+        isIntentionalPause = false
 
         if (videoId == currentVideoId && isPlayerReady) {
             if (startSeconds > 0) {
@@ -301,31 +334,26 @@ class YouTubePlayerController private constructor(private val appContext: Contex
             return
         }
 
-        if (isPlayerReady && currentVideoId.isNotBlank()) {
-            currentVideoId = videoId
-            evaluate("loadVideo('$videoId', $startSeconds); playVideo();")
-            acquireLocks()
-            return
-        }
-
         currentVideoId = videoId
         isPlayerReady = false
 
         val html = buildHtml(videoId, startSeconds)
-        wv.loadDataWithBaseURL("https://www.youtube.com", html, "text/html", "UTF-8", null)
+        wv.loadDataWithBaseURL("https://www.youtube-nocookie.com", html, "text/html", "UTF-8", null)
         acquireLocks()
     }
 
     fun play() {
+        isIntentionalPause = false
         _isPlaying.value = true
         acquireLocks()
-        evaluate("playVideo();")
+        evaluate("window.isUserPlaying = true; playVideo();")
     }
 
     fun pause() {
+        isIntentionalPause = true
         _isPlaying.value = false
         releaseLocks()
-        evaluate("pauseVideo();")
+        evaluate("window.isUserPlaying = false; pauseVideo();")
     }
 
     fun seekTo(seconds: Float) {
@@ -367,6 +395,7 @@ class YouTubePlayerController private constructor(private val appContext: Contex
   #player { width: 100%; height: 100%; position: absolute; top: 0; left: 0; border: none; }
 </style>
 <script>
+  window.isUserPlaying = true;
   // OVERRIDE BROWSER VISIBILITY API SO BACKGROUND / SCREEN-OFF DOES NOT PAUSE PLAYBACK
   try {
     Object.defineProperty(document, 'hidden', { get: function() { return false; }, configurable: true });
@@ -375,19 +404,30 @@ class YouTubePlayerController private constructor(private val appContext: Contex
     Object.defineProperty(document, 'webkitVisibilityState', { get: function() { return 'visible'; }, configurable: true });
   } catch(e) {}
 
-  var blockEvts = ['visibilitychange', 'webkitvisibilitychange', 'blur', 'pagehide'];
+  var blockEvts = ['visibilitychange', 'webkitvisibilitychange', 'blur', 'pagehide', 'focusout'];
   blockEvts.forEach(function(evtName) {
     window.addEventListener(evtName, function(e) {
       if (e) e.stopImmediatePropagation();
+      if (window.isUserPlaying) {
+        try { playVideo(); } catch(err) {}
+      }
     }, true);
     document.addEventListener(evtName, function(e) {
       if (e) e.stopImmediatePropagation();
+      if (window.isUserPlaying) {
+        try { playVideo(); } catch(err) {}
+      }
     }, true);
   });
 </script>
 </head>
 <body>
-<div id='player'></div>
+<iframe id='player'
+  src='https://www.youtube-nocookie.com/embed/$videoId?enablejsapi=1&autoplay=1&playsinline=1&controls=1&rel=0&fs=1&modestbranding=1&iv_load_policy=3&start=$startSeconds'
+  frameborder='0'
+  allow='accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share'
+  allowfullscreen>
+</iframe>
 <script>
   var tag = document.createElement('script');
   tag.src = 'https://www.youtube.com/iframe_api';
@@ -398,61 +438,106 @@ class YouTubePlayerController private constructor(private val appContext: Contex
   var isReady = false;
 
   function onYouTubeIframeAPIReady() {
-    player = new YT.Player('player', {
-      height: '100%',
-      width: '100%',
-      videoId: '$videoId',
-      host: 'https://www.youtube-nocookie.com',
-      playerVars: {
-        'autoplay': 1,
-        'playsinline': 1,
-        'controls': 1,
-        'rel': 0,
-        'modestbranding': 1,
-        'enablejsapi': 1,
-        'widget_referrer': 'https://www.youtube.com',
-        'origin': 'https://www.youtube.com',
-        'start': $startSeconds,
-        'iv_load_policy': 3,
-        'fs': 1
-      },
-      events: {
-        'onReady': function(e) {
-          isReady = true;
-          if (window.AndroidBridge) {
-            try { window.AndroidBridge.onReady(); } catch(err) {}
-          }
-          if ($startSeconds > 0) {
-            try { e.target.seekTo($startSeconds, true); } catch(err) {}
-          }
-          try { e.target.playVideo(); } catch(err) {}
-        },
-        'onStateChange': function(e) {
-          if (window.AndroidBridge) {
-            try { window.AndroidBridge.onStateChange(e.data); } catch(err) {}
-          }
-        },
-        'onError': function(e) {
-          if (window.AndroidBridge) {
-            try { window.AndroidBridge.onError(e.data); } catch(err) {}
+    try {
+      player = new YT.Player('player', {
+        events: {
+          'onReady': function(e) {
+            isReady = true;
+            if (window.AndroidBridge) {
+              try { window.AndroidBridge.onReady(); } catch(err) {}
+            }
+            try { e.target.playVideo(); } catch(err) {}
+          },
+          'onStateChange': function(e) {
+            if (window.AndroidBridge) {
+              try { window.AndroidBridge.onStateChange(e.data); } catch(err) {}
+            }
+          },
+          'onError': function(e) {
+            if (window.AndroidBridge) {
+              try { window.AndroidBridge.onError(e.data); } catch(err) {}
+            }
           }
         }
-      }
-    });
+      });
+    } catch(err) {}
   }
 
-  function playVideo() { if (player && player.playVideo) player.playVideo(); }
-  function pauseVideo() { if (player && player.pauseVideo) player.pauseVideo(); }
-  function seekTo(sec) { if (player && player.seekTo) player.seekTo(sec, true); }
-  function setSpeed(rate) { if (player && player.setPlaybackRate) player.setPlaybackRate(rate); }
-  function setVolume(vol) { if (player && player.setVolume) player.setVolume(vol); }
-  function loadVideo(id, startSec) {
-    if (player && player.loadVideoById) {
-      if (startSec && startSec > 0) {
-        player.loadVideoById({ videoId: id, startSeconds: startSec });
-      } else {
-        player.loadVideoById(id);
+  // Dual listener: listen to postMessage from YouTube iframe directly
+  window.addEventListener('message', function(event) {
+    try {
+      var data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+      if (data && data.event === 'onReady') {
+        isReady = true;
+        if (window.AndroidBridge) window.AndroidBridge.onReady();
+      } else if (data && data.event === 'infoDelivery' && data.info) {
+        if (data.info.playerState !== undefined && window.AndroidBridge) {
+          window.AndroidBridge.onStateChange(data.info.playerState);
+        }
+        if (data.info.currentTime !== undefined && data.info.duration !== undefined && window.AndroidBridge) {
+          window.AndroidBridge.onProgress(data.info.currentTime, data.info.duration);
+        }
+      } else if (data && (data.event === 'onError' || (data.info && data.info.errorCode !== undefined))) {
+        var code = data.info ? data.info.errorCode : (data.error || 150);
+        if (window.AndroidBridge) window.AndroidBridge.onError(code);
       }
+    } catch(e) {}
+  });
+
+  function playVideo() {
+    if (player && player.playVideo) {
+      player.playVideo();
+    } else {
+      var iframe = document.getElementById('player');
+      if (iframe && iframe.contentWindow) {
+        iframe.contentWindow.postMessage('{"event":"command","func":"playVideo","args":""}', '*');
+      }
+    }
+  }
+
+  function pauseVideo() {
+    if (player && player.pauseVideo) {
+      player.pauseVideo();
+    } else {
+      var iframe = document.getElementById('player');
+      if (iframe && iframe.contentWindow) {
+        iframe.contentWindow.postMessage('{"event":"command","func":"pauseVideo","args":""}', '*');
+      }
+    }
+  }
+
+  function seekTo(sec) {
+    if (player && player.seekTo) {
+      player.seekTo(sec, true);
+    } else {
+      var iframe = document.getElementById('player');
+      if (iframe && iframe.contentWindow) {
+        iframe.contentWindow.postMessage(JSON.stringify({"event":"command","func":"seekTo","args":[sec, true]}), '*');
+      }
+    }
+  }
+
+  function setSpeed(rate) {
+    if (player && player.setPlaybackRate) player.setPlaybackRate(rate);
+  }
+
+  function setVolume(vol) {
+    if (player && player.setVolume) player.setVolume(vol);
+  }
+
+  function loadVideo(id, startSec) {
+    var iframe = document.getElementById('player');
+    if (iframe) {
+      iframe.src = 'https://www.youtube-nocookie.com/embed/' + id + '?enablejsapi=1&autoplay=1&playsinline=1&controls=1&rel=0&fs=1&modestbranding=1&iv_load_policy=3&start=' + (startSec || 0);
+    }
+    if (player && player.loadVideoById) {
+      try {
+        if (startSec && startSec > 0) {
+          player.loadVideoById({ videoId: id, startSeconds: startSec });
+        } else {
+          player.loadVideoById(id);
+        }
+      } catch(e) {}
     }
   }
 
@@ -461,7 +546,9 @@ class YouTubePlayerController private constructor(private val appContext: Contex
       try {
         var c = player.getCurrentTime();
         var d = player.getDuration();
-        window.AndroidBridge.onProgress(c, d);
+        if (c !== undefined && d !== undefined) {
+          window.AndroidBridge.onProgress(c, d);
+        }
       } catch(e) {}
     }
   }, 1000);

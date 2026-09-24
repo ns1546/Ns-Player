@@ -170,12 +170,13 @@ fun NSPlayerApp(factory: ViewModelProvider.Factory) {
             DriveModeScreen(viewModel = viewModel, onExit = { viewModel.setDriveMode(false) })
         }
 
-        // Persistent background host: when user is on other tabs (Library, Playlists, etc.), keeps YouTube audio playing without interruption
+        // Persistent background host: when user is on other tabs (Library, Playlists, etc.) or player is minimized, keeps YouTube audio playing without interruption
         val currentYTTrack by viewModel.currentYouTubeTrack.collectAsState()
         val navBackStackEntry by navController.currentBackStackEntryAsState()
         val currentRoute = navBackStackEntry?.destination?.route
+        val isYTPlayerVisible by viewModel.isYouTubePlayerVisible.collectAsState()
 
-        if (currentYTTrack != null && currentRoute != "youtube") {
+        if (currentYTTrack != null && (currentRoute != "youtube" || !isYTPlayerVisible)) {
             Box(
                 modifier = Modifier
                     .size(1.dp)

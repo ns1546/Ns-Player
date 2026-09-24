@@ -598,6 +598,13 @@ class PlayerManager private constructor(private val context: Context) {
         player.prepare()
         applyVolumeSettings()
         player.play()
+
+        try {
+            androidx.core.content.ContextCompat.startForegroundService(
+                context,
+                android.content.Intent(context, PlaybackService::class.java)
+            )
+        } catch (_: Exception) {}
         
         saveSongToPrefs(song, startPos)
         setupAudioEffects()

@@ -75,6 +75,8 @@ class YouTubeAudioForegroundService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private var silentAudioTrack: android.media.AudioTrack? = null
+    private var isAnchorRunning = false
 
     private var currentTitle = "YouTube Music"
     private var currentArtist = "Playing in Background"
@@ -88,6 +90,7 @@ class YouTubeAudioForegroundService : Service() {
         super.onCreate()
         createNotificationChannel()
         acquireLocks()
+        startSilentAudioAnchor()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -107,16 +110,19 @@ class YouTubeAudioForegroundService : Service() {
                 updateForegroundNotification()
                 if (isPlaying) {
                     acquireLocks()
+                    startSilentAudioAnchor()
                 }
             }
             ACTION_PLAY -> {
                 isPlaying = true
                 acquireLocks()
+                startSilentAudioAnchor()
                 YouTubePlayerController.getInstance(this).play()
                 updateForegroundNotification()
             }
             ACTION_PAUSE -> {
                 isPlaying = false
+                stopSilentAudioAnchor()
                 YouTubePlayerController.getInstance(this).pause()
                 updateForegroundNotification()
             }
@@ -127,6 +133,8 @@ class YouTubeAudioForegroundService : Service() {
                 sendBroadcast(Intent("com.example.ACTION_YT_PREV"))
             }
             ACTION_STOP -> {
+                isPlaying = false
+                stopSilentAudioAnchor()
                 releaseLocks()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -135,6 +143,60 @@ class YouTubeAudioForegroundService : Service() {
         }
 
         return START_STICKY
+    }
+
+    private fun startSilentAudioAnchor() {
+        if (isAnchorRunning) return
+        isAnchorRunning = true
+        try {
+            val sampleRate = 44100
+            val bufferSize = android.media.AudioTrack.getMinBufferSize(
+                sampleRate,
+                android.media.AudioFormat.CHANNEL_OUT_MONO,
+                android.media.AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(1024)
+
+            silentAudioTrack = android.media.AudioTrack.Builder()
+                .setAudioAttributes(
+                    android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    android.media.AudioFormat.Builder()
+                        .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(android.media.AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(bufferSize)
+                .setTransferMode(android.media.AudioTrack.MODE_STREAM)
+                .build()
+
+            silentAudioTrack?.play()
+
+            serviceScope.launch(Dispatchers.IO) {
+                val silentBuffer = ByteArray(bufferSize)
+                while (isAnchorRunning && isPlaying) {
+                    try {
+                        silentAudioTrack?.write(silentBuffer, 0, silentBuffer.size)
+                        kotlinx.coroutines.delay(250)
+                    } catch (_: Exception) {
+                        break
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun stopSilentAudioAnchor() {
+        isAnchorRunning = false
+        try {
+            silentAudioTrack?.stop()
+            silentAudioTrack?.release()
+            silentAudioTrack = null
+        } catch (_: Exception) {}
     }
 
     private fun acquireLocks() {
